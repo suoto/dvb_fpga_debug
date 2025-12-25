@@ -6,8 +6,13 @@ import logging
 import math
 from collections import namedtuple
 
-from common import (BaseMemoryRegion, CodeRate, ConstellationType, FrameType,
-                    tabulate)
+from dvb.common import (
+    BaseMemoryRegion,
+    CodeRate,
+    ConstellationType,
+    FrameType,
+    tabulate,
+)
 
 AxiInterface = namedtuple("AxiInterface", ("slave", "master"))
 Strobes = namedtuple("Strobes", ("tvalid", "tready"))
@@ -299,38 +304,48 @@ class DvbEncoder(BaseMemoryRegion):
 
     def write_polyphase_filter_coefficients(self):
         self._logger.info("Updating polyphase filter coefficients")
-        self._write(0x3D0, 0x003C003C)
-        self._write(0x3D4, 0xFFF6FFF6)
-        self._write(0x3D8, 0xFFC8FFC8)
-        self._write(0x3DC, 0x00410041)
-        self._write(0x3E0, 0x000B000B)
-        self._write(0x3E4, 0xFF75FF75)
-        self._write(0x3E8, 0x00640064)
-        self._write(0x3EC, 0x00E000E0)
-        self._write(0x3F0, 0xFECAFECA)
-        self._write(0x3F4, 0xFECBFECB)
-        self._write(0x3F8, 0x02B702B7)
-        self._write(0x3FC, 0x017D017D)
-        self._write(0x400, 0xFA18FA18)
-        self._write(0x404, 0xFE52FE52)
-        self._write(0x408, 0x140B140B)
-        self._write(0x40C, 0x21B621B6)
-        self._write(0x410, 0x140B140B)
-        self._write(0x414, 0xFE52FE52)
-        self._write(0x418, 0xFA18FA18)
-        self._write(0x41C, 0x017D017D)
-        self._write(0x420, 0x02B702B7)
-        self._write(0x424, 0xFECBFECB)
-        self._write(0x428, 0xFECAFECA)
-        self._write(0x42C, 0x00E000E0)
-        self._write(0x430, 0x00640064)
-        self._write(0x434, 0xFF75FF75)
-        self._write(0x438, 0x000B000B)
-        self._write(0x43C, 0x00410041)
-        self._write(0x440, 0xFFC8FFC8)
-        self._write(0x444, 0xFFF6FFF6)
-        self._write(0x448, 0x003C003C)
-        self._write(0x44C, 0xFFE8FFE8)
+        coeffs = [
+            -0.000728216778953,
+            0.00181682675611,
+            -0.00029152361094,
+            -0.00169956660829,
+            0.00198084092699,
+            0.000321642903145,
+            -0.00423926254734,
+            0.00304758665152,
+            0.00683168089017,
+            -0.00947270914912,
+            -0.00942199118435,
+            0.0211963132024,
+            0.0116332434118,
+            -0.0461302995682,
+            -0.0131214763969,
+            0.156597167253,
+            0.263359487057,
+            0.156597167253,
+            -0.0131214763969,
+            -0.0461302995682,
+            0.0116332434118,
+            0.0211963132024,
+            -0.00942199118435,
+            -0.00947270914912,
+            0.00683168089017,
+            0.00304758665152,
+            -0.00423926254734,
+            0.000321642903145,
+            0.00198084092699,
+            -0.00169956660829,
+            -0.00029152361094,
+            0.00181682675611,
+            -0.000728216778953,
+        ]
+
+        addr = 0x3CC
+        for coeff in coeffs:
+            reg = (toFixedPoint(coeff, 16) << 16) | toFixedPoint(coeff, 16)
+            self._logger.info("Writing: %.3x => %.8x", addr, reg)
+            self._write(addr, reg)
+            addr += 4
 
     def updateBitMapperRam(
         self,
@@ -359,7 +374,9 @@ class DvbEncoder(BaseMemoryRegion):
         ):
             #  self._logger.info("Bit mapper RAM: %2d: % .3f, % .3f", offset, cos, sin)
             reg = (toFixedPoint(cos, 16) << 16) | toFixedPoint(sin, 16)
-            self._write(bit_mapper_ram_base_addr + 4 * offset, reg)
+            addr = bit_mapper_ram_base_addr + 4 * offset
+            self._logger.debug("Writing addr 0x%.3X: 0x%.8X", addr, reg)
+            self._write(addr, reg)
 
     def init(self):
         self._logger.info("Initializing DVB encoder")
@@ -440,12 +457,16 @@ class DvbEncoder(BaseMemoryRegion):
         result["axi_debug"] = axi
         return result
 
-    def printStatus(self):
+    def readConstellationMapperRam(self, addr) -> int:
+        self._write(0xC, addr)
+        return self._read(0x14)
+
+    def printStatus(self, print_map=False):
         table = [
             ("General config",),
             (
                 "PL scramb SR init",
-                "0x%.5X" % self.physical_layer_scrambler_shift_reg_init,
+                f"0x{self.physical_layer_scrambler_shift_reg_init:05X}",
             ),
             (
                 "Enable dummy frames",
@@ -501,6 +522,46 @@ class DvbEncoder(BaseMemoryRegion):
             + [" ".join(x) for x in tabulate(table)]
             + ["-----"]
             + [" ".join(x) for x in tabulate(debug_table)]
-            + [(2 * 50 + 14) * "="]
         )
+
+        if print_map:
+            func = self.readConstellationMapperRam
+
+            constellation_map = [
+                ["#" , "QPSK"             , "#" , "8PSK"              , "#" , "16APSK"            , "#" , "32APSK"]            ,
+                [0   , f"0x{func(0):08X}" , 0   , f"0x{func(4):08X}"  , 0   , f"0x{func(12):08X}" , 0   , f"0x{func(28):08X}"] ,
+                [1   , f"0x{func(1):08X}" , 1   , f"0x{func(5):08X}"  , 1   , f"0x{func(13):08X}" , 1   , f"0x{func(29):08X}"] ,
+                [2   , f"0x{func(2):08X}" , 2   , f"0x{func(6):08X}"  , 2   , f"0x{func(14):08X}" , 2   , f"0x{func(30):08X}"] ,
+                [3   , f"0x{func(3):08X}" , 3   , f"0x{func(7):08X}"  , 3   , f"0x{func(15):08X}" , 3   , f"0x{func(31):08X}"] ,
+                [""  , ""                 , 4   , f"0x{func(8):08X}"  , 4   , f"0x{func(16):08X}" , 4   , f"0x{func(32):08X}"] ,
+                [""  , ""                 , 5   , f"0x{func(9):08X}"  , 5   , f"0x{func(17):08X}" , 5   , f"0x{func(33):08X}"] ,
+                [""  , ""                 , 6   , f"0x{func(10):08X}" , 6   , f"0x{func(18):08X}" , 6   , f"0x{func(34):08X}"] ,
+                [""  , ""                 , 7   , f"0x{func(11):08X}" , 7   , f"0x{func(19):08X}" , 7   , f"0x{func(35):08X}"] ,
+                [""  , ""                 , ""  , ""                  , 8   , f"0x{func(20):08X}" , 8   , f"0x{func(36):08X}"] ,
+                [""  , ""                 , ""  , ""                  , 9   , f"0x{func(21):08X}" , 9   , f"0x{func(37):08X}"] ,
+                [""  , ""                 , ""  , ""                  , 10  , f"0x{func(22):08X}" , 10  , f"0x{func(38):08X}"] ,
+                [""  , ""                 , ""  , ""                  , 11  , f"0x{func(23):08X}" , 11  , f"0x{func(39):08X}"] ,
+                [""  , ""                 , ""  , ""                  , 12  , f"0x{func(24):08X}" , 12  , f"0x{func(40):08X}"] ,
+                [""  , ""                 , ""  , ""                  , 13  , f"0x{func(25):08X}" , 13  , f"0x{func(41):08X}"] ,
+                [""  , ""                 , ""  , ""                  , 14  , f"0x{func(26):08X}" , 14  , f"0x{func(42):08X}"] ,
+                [""  , ""                 , ""  , ""                  , 15  , f"0x{func(27):08X}" , 15  , f"0x{func(43):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 16  , f"0x{func(44):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 17  , f"0x{func(45):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 18  , f"0x{func(46):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 19  , f"0x{func(47):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 20  , f"0x{func(48):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 21  , f"0x{func(49):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 22  , f"0x{func(50):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 23  , f"0x{func(51):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 24  , f"0x{func(52):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 25  , f"0x{func(53):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 26  , f"0x{func(54):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 27  , f"0x{func(55):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 28  , f"0x{func(56):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 29  , f"0x{func(57):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 30  , f"0x{func(58):08X}"] ,
+                [""  , ""                 , ""  , ""                  , ""  , ""                  , 31  , f"0x{func(59):08X}"] ,
+            ]
+            output += ["-----"] + [" ".join(x) for x in tabulate(constellation_map)]
+        output += [(2 * 50 + 14) * "="]
         print("\n".join(output))

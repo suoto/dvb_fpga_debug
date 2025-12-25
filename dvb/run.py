@@ -1,26 +1,34 @@
 #!/usr/bin/env python3
 
-# pylint: disable=missing-docstring
-# pylint: disable=invalid-name
-# pylint: disable=wrong-import-position
-
 import argparse
 import logging
+import os
 import os.path as p
 import re
 import struct
 import sys
 import time
+from multiprocessing.pool import ThreadPool
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
+from matplotlib import pyplot as plt  # type: ignore
 
-sys.path.insert(0, p.abspath(p.dirname(__file__)))
+from dvb.common import (
+    TID_MAP,
+    BaseMemoryRegion,
+    CodeRate,
+    ConstellationType,
+    FrameType,
+    run,
+)
+from dvb.dvb_encoder import DvbEncoder  # type: ignore
+from dvb.logger import setupLogging
 
-from common import (TID_MAP, CodeRate, ConstellationType,  # type: ignore
-                     FrameType, run)
-from dvb_encoder import DvbEncoder  # type: ignore
-from logger import setupLogging  # type: ignore
+# pylint: disable=missing-docstring
+# pylint: disable=invalid-name
+# pylint: disable=wrong-import-position
+
 
 _RE_CONFIG = re.compile(
     r"(FECFRAME_(?:SHORT|NORMAL))_(MOD_.*?)_(C.*?)_input.bin"
@@ -98,6 +106,9 @@ def _compare(
         _logger.warning("Expected %d bytes, got %d", len(actual), len(expected))
 
     length = min(len(actual), len(expected))
+    _logger.debug(
+        "Input lengths were %d and %d, using %d", len(actual), len(expected), length
+    )
     correlation = 0.0
     if length:
         correlation_matrix = np.corrcoef(actual[:length], expected[:length])
@@ -123,23 +134,35 @@ def _compare(
             func = _logger.error
             errors += 1
 
-        func(
-            "%4d || Got %6d, expected %6d || Thresholds: [%6d, %6d] || delta = %d",
-            i,
-            actual_word,
-            expected_word,
-            lower_threshold,
-            upper_threshold,
-            expected_word - actual_word,
-        )
+        if passed:
+            func(
+                "%4d || Got %6d, expected %6d || Thresholds: [%6d, %6d] || delta = %d",
+                i,
+                actual_word,
+                expected_word,
+                lower_threshold,
+                upper_threshold,
+                expected_word - actual_word,
+            )
 
         if errors >= 10:
             passed = False
-            break
+            #  break
 
-    _logger.info(
-        "Errors: %d / %d (%.2f%%)", errors, len(expected), 100 * errors / len(expected)
-    )
+    if errors:
+        _logger.error(
+            "Errors: %d / %d (%.2f%%)",
+            errors,
+            len(expected),
+            100 * errors / len(expected),
+        )
+    else:
+        _logger.info(
+            "Errors: %d / %d (%.2f%%)",
+            errors,
+            len(expected),
+            100 * errors / len(expected),
+        )
 
     return passed, correlation
 
@@ -149,11 +172,55 @@ def configureFpga():
     run(("fpgautil", "-b", "~/design_1_wrapper.bit.bin"))
 
 
+def _parseArgs():
+    "Parse command line arguments"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="append_const",
+        const=1,
+        help="Increases verbosity. Passing multiple times progressively increases verbosity",
+    )
+
+    parser.add_argument(
+        "infiles",
+        action="store",
+        nargs="+",
+        default=None,
+        help="List of input files to test",
+    )
+
+    args = parser.parse_args()
+
+    level = logging.WARNING
+
+    if args.verbose:
+        if len(args.verbose) == 1:
+            level = "INFO"
+        elif len(args.verbose) == 2:
+            level = "DEBUG"
+        elif len(args.verbose) > 2:
+            level = 4
+
+    print(f"Log level set to {repr(level)}")
+
+    setupLogging(sys.stdout, level, True)
+    globals()["_logger"] = logging.getLogger(__name__)
+
+    return args
+
+
 class Runner:
+    _dev_write_data = "/dev/xdma0_h2c_0"
+    _dev_read_data = "/dev/xdma0_c2h_0"
+    _dev_metadata = "/dev/xdma0_h2c_1"
+
     def __init__(self):
         _logger.debug("Creating encoder")
-        self.encoder = DvbEncoder(0x44A0_0000, 16 * 1024)
-        self.init()
+        self.encoder = DvbEncoder(0, 16 * 1024)
+        #  self.init()
+        #  self.axi = BaseMemoryRegion(0x2000, 1024)
         #  self.reset()
 
     def sendFromFile(
@@ -177,15 +244,106 @@ class Runner:
             frame_type=frame_type, constellation=constellation, code_rate=code_rate
         )
 
-        #  self.meta_fifo.send(tid.to_bytes(1, "little"))
-        #  with open(path, "rb") as fd:
-        #      self.data_fifo.send(fd.read(), tid)
+        #  _logger.info("Status before any write")
+        #  self.encoder.printStatus()
+
+        pool = ThreadPool(2)
+        pool.apply_async(self.writeMetadata, (tid.to_bytes(1, "little"),))
+
+        with open(path, "rb") as fd:
+            pool.apply_async(self.writeData, (fd.read(),))
+
+        pool.close()
+        #  _logger.info("Status right after writing")
+        #  self.encoder.printStatus()
+        _logger.debug("Waiting for processes to complete")
+        pool.join()
+        #  _logger.info("Status after writes completed")
+        #  self.encoder.printStatus()
+        _logger.debug("All writes completed")
+
+    def writeMetadata(self, tid: bytes):
+        _logger.debug("Writing metadata")
+        with open(self._dev_metadata, "wb") as fd:
+            _logger.debug("Writing to fd")
+            result = fd.write(tid)
+
+        _logger.debug("Completed")
+        return result
+
+    def writeData(self, data: bytes):
+        _logger.debug("Writing data")
+        with open(self._dev_write_data, "wb") as fd:
+            _logger.debug("Writing to fd")
+            result = fd.write(data)
+
+        _logger.debug("Completed")
+        return result
+
+    def readData(self) -> bytes:
+        _logger.debug("Reading data")
+        result: bytes = b""
+        #  return result
+        fd = os.open(self._dev_read_data, os.O_RDONLY)
+        try:
+            while True:
+                _logger.log(5, "Bytes so far: %d", len(result))
+
+                #  chunk = bytes([x for i, x in enumerate(os.read(fd, 32)) if i % 8 < 4])
+                chunk = os.read(fd, 32)
+
+                _logger.log(5, "Chunk length is %d", len(chunk))
+
+                if len(result) < 1024:
+                    _logger.debug("Chunk: %s", [f"{x:02x}" for x in chunk])
+
+                result += (
+                    chunk[2:4]
+                    + chunk[0:2]
+                    + chunk[6:8]
+                    + chunk[4:6]
+                    + chunk[10:12]
+                    + chunk[8:10]
+                    + chunk[14:16]
+                    + chunk[12:14]
+                    + chunk[18:20]
+                    + chunk[16:18]
+                    + chunk[22:24]
+                    + chunk[20:22]
+                    + chunk[26:28]
+                    + chunk[24:26]
+                    + chunk[30:32]
+                    + chunk[28:30]
+                )
+
+                if len(result) < 1024:
+                    _logger.debug("Chunk: %s", [f"{x:02x}" for x in chunk])
+
+                if len(chunk) < 32:
+                    _logger.log(
+                        5, "Chunk has %d bytes, detected end of frame", len(chunk)
+                    )
+                    break
+
+        finally:
+            os.close(fd)
+
+        if not result:
+            _logger.error("Timed out trying to read data")
+
+        with open("output.bin", "wb") as fp:
+            fp.write(bytes(result))
+
+        _logger.debug("Completed")
+        _logger.info("Read %d bytes", len(result))
+        return result
 
     def run(self, infile: Optional[str]) -> Tuple[bool, float]:
         if infile is None:
             self.encoder.printStatus()
             return True, 1
 
+        _logger.debug("infile basename is %s", p.basename(infile))
         if p.basename(infile) not in SUPPORTED_CONFIGS:
             _logger.warning("Configuration %s is not supported", infile)
 
@@ -202,17 +360,23 @@ class Runner:
             getattr(ConstellationType, constellation),
             getattr(CodeRate, code_rate),
         )
+
+        #  _logger.info("Waiting for frame to complete")
+        #  for _ in range(100):
+        #      if not self.encoder.getFramesInTransit():
+        #          break
+        #      time.sleep(0.1)
+        #  if self.encoder.getFramesInTransit():
+        #      assert False, "Timed out waiting for frame to complete"
+        #  _logger.info("No more frames in transit")
+
+        try:
+            result = _toListOfInt(self.readData())
+        except KeyboardInterrupt:
+            _logger.error("Unable to read data after sending %s", infile)
+            raise
         #  print("Status after sending data")
         #  self.encoder.printStatus()
-
-        _logger.info("Waiting for frame to complete")
-        for _ in range(100):
-            if not self.encoder.getFramesInTransit():
-                break
-            time.sleep(0.1)
-        if self.encoder.getFramesInTransit():
-            assert False, "Timed out waiting for frame to complete"
-        #  result = _toListOfInt(self.data_fifo.receive())
 
         with open(outfile, "rb") as fd:
             expected = _toListOfInt(fd.read())
@@ -221,9 +385,6 @@ class Runner:
         #  self.encoder.printStatus()
 
         return _compare(actual=result, expected=expected, tolerance=TOLERANCE)
-
-    def reset(self):
-        _logger.info("Resetting data FIFOs")
 
     def init(self):
         self.encoder.init()
@@ -264,6 +425,8 @@ class Runner:
                     )
                     tests_failed.append((infile, duration, correlation))
 
+                time.sleep(0.5)
+
         print(len(tests_passed), "tests passed:")
         for name in tests_passed:
             print("-", name)
@@ -272,78 +435,21 @@ class Runner:
             print("-", name)
 
 
-def _parseArgs():
-    "Parse command line arguments"
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="append_const",
-        const=1,
-        help="Increases verbosity. Passing multiple times progressively increases verbosity",
-    )
-    parser.add_argument(
-        "--monitor",
-        "-m",
-        action="store",
-        help="Address to listen to when publishing stats",
-    )
-
-    parser.add_argument(
-        "infiles",
-        action="store",
-        nargs="*",
-        default=None,
-        help="List of input files to test",
-    )
-
-    args = parser.parse_args()
-
-    level = logging.WARNING
-
-    if args.verbose:
-        if len(args.verbose) == 1:
-            level = logging.INFO
-        elif len(args.verbose) > 1:
-            level = logging.DEBUG
-
-    setupLogging(sys.stdout, level, True)
-    globals()["_logger"] = logging.getLogger(__name__)
-
-    return args
-
-
 def main():
     args = _parseArgs()
-    _runner = Runner()
+    runner = Runner()
 
-    if args.monitor is not None:
-        import bottle  # type: ignore
-
-        @bottle.route("/read/status")
-        def index():
-            result = _runner.encoder.getStatus()
-            return result
-
-        host = args.monitor.split(":")
-        port = 60001
-        if isinstance(host, list):
-            host, port = host
-        bottle.run(host=host, port=port)
-
-    elif len(args.infiles) > 1:
-        _runner.runMultiple(args.infiles)
+    if len(args.infiles) > 1:
+        runner.runMultiple(args.infiles)
     elif len(args.infiles) == 1:
         infile = args.infiles.pop()
-        start = time.time()
-        passed, correlation = _runner.run(infile)
-        print(
-            f"{infile}, time={time.time() - start:.2f}, correlation={correlation}, passed={passed}"
-        )
+        while True:
+            start = time.time()
+            passed, correlation = runner.run(infile)
+            print(
+                f"{infile}, time={time.time() - start:.2f}, correlation={correlation}, passed={passed}"
+            )
     else:
-        _runner.encoder.printStatus()
+        runner.encoder.printStatus()
 
-    return _runner
-
-
-runner = main()
+    return runner

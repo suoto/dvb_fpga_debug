@@ -14,11 +14,11 @@ if IS_ARM:
     if os.environ.get("FORCE_PEEKPOKE", None) is not None:
         from dvb.arm import BaseMemoryRegion
     else:
-        from .peek_poke import BaseMemoryRegion
+        from dvb.peek_poke import BaseMemoryRegion
 elif IS_ODYSSEY:
-    from foo.xdma import BaseMemoryRegion
+    from dvb.xdma import BaseMemoryRegion
 else:
-    from .fake_access import BaseMemoryRegion
+    from dvb.fake_access import BaseMemoryRegion
 
 
 def run(cmd):

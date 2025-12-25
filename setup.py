@@ -36,10 +36,13 @@ setuptools.setup(
         "tabulate>=0.8.5",
         "typing>=3.7.4",
         "waitress>=0.9.0",
+        "numpy>=2.2.6",
     ],
     entry_points={
         "console_scripts": [
-            "dvb_status=__main__:printStatus",
+            "dvb_status=dvb.__main__:dvbStatus",
+            "dvb_test=dvb.run:main",
+            "dvb_compare=dvb.compare:main",
         ]
     },
 )
